@@ -2,39 +2,45 @@
 """
 new_bot.py — Telegram-бот жалоб (Render Web Service, gunicorn, webhook).
 
-ЧТО ИСПРАВЛЕНО В ЭТОЙ ВЕРСИИ (почему кнопка «сообщения чата» молчала):
+ГЛАВНАЯ ПРИЧИНА, ПО КОТОРОЙ КНОПКА «сообщения чата» НЕ РАБОТАЛА:
 
-1. ВЕБХУК МОГ БЫТЬ НЕ УСТАНОВЛЕН.
-   Жалобы приходят админу через /relay/report (ВДС сам пушит их HTTP-запросом),
-   поэтому сообщения в Telegram появляются даже если вебхук не настроен.
-   А вот НАЖАТИЕ кнопки прилетает только через вебхук. Нет вебхука ->
-   callback_query никуда не приходит -> кнопка крутится и ничего не делает.
-   Теперь вебхук ставится автоматически при старте (ensure_webhook), плюс есть
-   /diag, который показывает getWebhookInfo.
+    setWebhook -> {'ok': False, 'error_code': 400,
+                   'description': 'Bad Request: secret token contains
+                                   unallowed characters'}
 
-2. ЗАПРОС К ВДС ВЫПОЛНЯЛСЯ ВНУТРИ ВЕБХУКА (до 45+45 сек).
-   gunicorn по умолчанию убивает воркер через 30 сек -> ответ Telegram не
-   уходит, файл не отправляется, в логах только SIGKILL. Плюс Telegram
-   ретраит апдейт и всё повторяется по кругу.
-   Теперь тяжёлая работа уходит в фоновый поток, вебхук отвечает 200 сразу.
+Telegram разрешает в secret_token только символы [A-Za-z0-9_-] (1..256).
+Секрет, сгенерированный через `openssl rand -base64 32`, содержит '+', '/'
+и '=' — setWebhook падает, вебхук НЕ устанавливается, и бот не получает от
+Telegram вообще ничего: ни callback_query от кнопок, ни команды /diag, /dump.
+При этом жалобы продолжают приходить, потому что ВДС пушит их напрямую в
+POST /relay/report, минуя Telegram-апдейты. Отсюда обманчивая картина:
+«сообщения идут, а кнопки мёртвые».
 
-3. ОШИБКИ ГЛОТАЛИСЬ.
-   Если VDS_ADMIN_SECRET не задан / не совпал, или в жалобе нет chat_id —
-   админ не видел причины. Теперь любая ошибка приходит админу текстом
-   с конкретным кодом и подсказкой, что править.
+Что сделано:
+  * Сырой WEBHOOK_SECRET больше не уходит в Telegram. Из него выводится
+    валидный токен (sha256-hex). Переменную на Render менять НЕ нужно.
+  * Если Telegram всё же ругается на secret_token — вебхук ставится без него
+    (защита остаётся за счёт секретного пути в URL).
+  * Путь /webhook/<...> принимает и производный токен, и старый сырой секрет,
+    чтобы уже настроенный вебхук не отвалился.
+  * Если вебхук не встал — админу приходит сообщение с причиной, а не тишина.
+  * Тяжёлая выгрузка с ВДС ушла в фоновый поток: раньше два запроса по 45 сек
+    внутри вебхука перебивали gunicorn timeout, воркер убивался, файл не уходил.
+  * Ошибки не глотаются: неверный секрет ВДС, отсутствующий chat_id, недоступный
+    сервер — всё приходит админу текстом.
+  * БД теперь не обязательна: пул открывается лениво и в фоне, недоступная база
+    больше не тормозит старт на 10 секунд и не мешает кнопкам.
 
-Дополнительно:
-  * /diag           — состояние конфига + пинг ВДС + getWebhookInfo
-  * /dump <chat_id> — выгрузить переписку вручную, не дожидаясь жалобы
-  * chat_id больше не обязан быть числом до отправки — валидирует ВДС
-  * .html дублируется .txt-версией (Telegram на телефоне HTML не превьюит)
+Диагностика:
+  /diag           — конфиг + getWebhookInfo + пинг ВДС
+  /dump 29        — выгрузить переписку вручную (просто число, без <> и слова id)
+  /last           — последние жалобы (нужна рабочая БД)
 
 Запуск на Render:
   Build:  pip install -r requirements.txt
   Start:  gunicorn new_bot:app -c gunicorn_bot.py
-  ВАЖНО: в gunicorn_bot.py -> timeout = 120, threads = 4
 
-Переменные окружения (Render):
+Переменные окружения:
   BOT_TOKEN, ADMIN_TELEGRAM_ID, WEBHOOK_SECRET, PUBLIC_URL
   REPORT_RELAY_SECRET   — тот же, что на ВДС
   VDS_BASE_URL          — https://vuntserverrr.site
@@ -46,6 +52,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import logging
 import threading
 from datetime import datetime, timezone
@@ -53,7 +60,10 @@ from datetime import datetime, timezone
 import requests
 from flask import Flask, request, jsonify
 
-from psycopg_pool import ConnectionPool
+try:
+    from psycopg_pool import ConnectionPool
+except Exception:  # без БД бот обязан работать
+    ConnectionPool = None
 
 try:
     from dotenv import load_dotenv
@@ -83,17 +93,68 @@ TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 app = Flask(__name__)
 
+
+# ------------------------------------------------- токен вебхука (тот самый баг)
+
+_TOKEN_OK_RE = re.compile(r'^[A-Za-z0-9_-]{1,256}$')
+
+
+def _derive_token(raw: str) -> str:
+    """Валидный для Telegram и для URL токен из произвольного секрета."""
+    if _TOKEN_OK_RE.match(raw or ''):
+        return raw
+    digest = hashlib.sha256((raw or '').encode('utf-8')).hexdigest()
+    log.warning('WEBHOOK_SECRET содержит символы, недопустимые для Telegram '
+                '(разрешены только A-Za-z0-9_-). Использую производный токен '
+                'sha256. Менять переменную на Render не нужно.')
+    return digest
+
+
+WEBHOOK_TOKEN = _derive_token(WEBHOOK_SECRET)
+
+# Путь принимаем и по производному токену, и по сырому секрету — чтобы
+# уже настроенный ранее вебхук со старым URL продолжал работать.
+_VALID_WEBHOOK_PATHS = {WEBHOOK_TOKEN}
+if WEBHOOK_SECRET:
+    _VALID_WEBHOOK_PATHS.add(WEBHOOK_SECRET)
+
+_VALID_HEADER_TOKENS = {WEBHOOK_TOKEN}
+if WEBHOOK_SECRET and _TOKEN_OK_RE.match(WEBHOOK_SECRET):
+    _VALID_HEADER_TOKENS.add(WEBHOOK_SECRET)
+
+
+# ------------------------------------------------------------------- БД (опц.)
+
+# Пул открываем ЛЕНИВО и в фоне. Раньше pool.open() на старте висел 10 секунд
+# ('couldn't get a connection after 10.00 sec') и задерживал инициализацию,
+# включая установку вебхука. БД нужна только для /last и журнала действий —
+# chat_id для выгрузки приходит прямо в callback_data кнопки.
 pool = None
-if DATABASE_URL:
-    pool = ConnectionPool(
-        DATABASE_URL, min_size=1, max_size=3, timeout=10,
-        kwargs={'autocommit': True}, open=False
-    )
+_pool_state = 'disabled' if not DATABASE_URL else 'pending'
+_pool_error = ''
+_pool_lock = threading.Lock()
+
+
+def _open_pool_bg():
+    global pool, _pool_state, _pool_error
+    if not DATABASE_URL or ConnectionPool is None:
+        _pool_state = 'disabled'
+        return
     try:
-        pool.open()
-        log.info('PostgreSQL pool открыт')
+        p = ConnectionPool(DATABASE_URL, min_size=1, max_size=3, timeout=8,
+                           kwargs={'autocommit': True}, open=False)
+        p.open(wait=True, timeout=15)
+        with p.connection() as conn:
+            conn.execute(SCHEMA_SQL)
+        with _pool_lock:
+            pool = p
+            _pool_state = 'ok'
+        log.info('PostgreSQL: пул открыт, схема проверена')
     except Exception as e:
-        log.error('Пул к БД не открылся: %s', e)
+        _pool_state = 'error'
+        _pool_error = f'{type(e).__name__}: {str(e)[:200]}'
+        log.error('PostgreSQL недоступна (%s). Бот продолжит работать без БД: '
+                  'кнопки и выгрузка чата от неё не зависят.', _pool_error)
 
 
 SCHEMA_SQL = """
@@ -111,20 +172,9 @@ CREATE INDEX IF NOT EXISTS idx_report_actions_report ON report_actions (report_i
 _init_lock = threading.Lock()
 _initialized = False
 
-# Чтобы один и тот же апдейт (Telegram ретраит при таймауте) не выгружался дважды
+# Дедупликация: Telegram ретраит апдейт при таймауте, а нам не нужен второй дамп
 _seen_updates = set()
 _seen_lock = threading.Lock()
-
-
-def init_db():
-    if not pool:
-        return
-    try:
-        with pool.connection() as conn:
-            conn.execute(SCHEMA_SQL)
-        log.info('Схема report_actions проверена/создана')
-    except Exception as e:
-        log.error('init_db: %s', e)
 
 
 # ------------------------------------------------------------ Telegram API
@@ -140,7 +190,7 @@ def tg(method: str, **payload):
             log.error('%s -> %s', method, body)
         return body
     except Exception as e:
-        log.error('%s исключение: %s', method, e)
+        log.error('%s исключение: %s: %s', method, type(e).__name__, str(e)[:200])
         return None
 
 
@@ -172,7 +222,7 @@ def send_document(chat_id, filename: str, content: bytes,
             log.error('sendDocument -> %s', body)
         return body
     except Exception as e:
-        log.error('sendDocument исключение: %s', e)
+        log.error('sendDocument исключение: %s: %s', type(e).__name__, str(e)[:200])
         return None
 
 
@@ -191,8 +241,8 @@ def log_action(report_id, admin_id, action, result='pending'):
 
 
 def get_report(report_id):
-    """Фолбэк: если в кнопке нет chat_id, пробуем взять его из БД.
-    Работает только если DATABASE_URL бота смотрит в ту же базу, что и ВДС."""
+    """Фолбэк, если в кнопке нет chat_id. Требует, чтобы DATABASE_URL бота
+    смотрел в ту же базу, куда пишет ВДС."""
     if not pool or not report_id:
         return None
     try:
@@ -218,8 +268,8 @@ def get_report(report_id):
 def fetch_chat_dump(chat_id):
     """
     (html_bytes, stats) при успехе или (None, текст_ошибки).
-    Сообщения в БД зашифрованы Fernet, ключ есть только на ВДС — поэтому
-    расшифровку делает он, бот только пересылает готовый HTML.
+    Сообщения в БД зашифрованы Fernet, ключ есть только на ВДС — расшифровку
+    делает он, бот лишь пересылает готовый HTML.
     """
     if not VDS_ADMIN_SECRET:
         return None, ('VDS_ADMIN_SECRET не задан в переменных Render.\n'
@@ -240,7 +290,7 @@ def fetch_chat_dump(chat_id):
             return None, f'ВДС: некорректный chat_id «{chat_id}» (ожидается число)'
         if rj.status_code == 404:
             return None, (f'Чат {chat_id} не найден в БД.\n'
-                          'Скорее всего чат удалён «у всех» — строки стёрты безвозвратно.')
+                          'Скорее всего он удалён «у всех» — строки стёрты безвозвратно.')
         if not rj.ok:
             return None, f'ВДС ответил {rj.status_code}: {rj.text[:200]}'
 
@@ -260,7 +310,7 @@ def fetch_chat_dump(chat_id):
             return None, f'ВДС ответил {rh.status_code} на HTML-выгрузку'
         return rh.content, stats
     except requests.Timeout:
-        return None, 'ВДС не ответил за 30 секунд (сервер/БД тормозит или лежит)'
+        return None, 'ВДС не ответил за 30 секунд (сервер или БД тормозит/лежит)'
     except requests.ConnectionError as e:
         return None, (f'Не достучался до {VDS_BASE_URL}: {str(e)[:180]}\n'
                       'Проверь домен, HTTPS-сертификат и что сервер запущен.')
@@ -269,8 +319,8 @@ def fetch_chat_dump(chat_id):
 
 
 def dump_to_text(payload) -> bytes:
-    """Плоская .txt-копия: Telegram на телефоне HTML-файл не показывает превью,
-    а txt открывает прямо в приложении."""
+    """Плоская .txt-копия: мобильный Telegram HTML-файл не превьюит, только
+    скачивает, а .txt открывает прямо в приложении."""
     lines = [f'Переписка чата #{payload.get("chat_id")}',
              f'Создан: {payload.get("created_at")}',
              'Участники:']
@@ -308,8 +358,7 @@ def deliver_dump(chat_id, report_id=None, admin_id=ADMIN_TELEGRAM_ID):
     if content is None:
         log.error('dump чата %s не получен: %s', chat_id, info)
         log_action(report_id, admin_id, 'view_messages', f'error: {info}'[:200])
-        send(ADMIN_TELEGRAM_ID,
-             f'❌ Не удалось выгрузить чат {chat_id}\n\n{info}')
+        send(ADMIN_TELEGRAM_ID, f'❌ Не удалось выгрузить чат {chat_id}\n\n{info}')
         return False
 
     caption = (
@@ -324,28 +373,24 @@ def deliver_dump(chat_id, report_id=None, admin_id=ADMIN_TELEGRAM_ID):
     res = send_document(ADMIN_TELEGRAM_ID, f'chat_{chat_id}.html', content, caption)
     ok = bool(res and res.get('ok'))
 
-    # txt-копия: HTML в мобильном Telegram не превьюится
     try:
         txt = dump_to_text(info.get('json') or {})
-        send_document(ADMIN_TELEGRAM_ID, f'chat_{chat_id}.txt', txt,
-                      '', mime='text/plain')
+        send_document(ADMIN_TELEGRAM_ID, f'chat_{chat_id}.txt', txt, '', mime='text/plain')
     except Exception as e:
         log.error('txt-копия не собралась: %s', e)
 
     if not ok:
         send(ADMIN_TELEGRAM_ID,
-             f'⚠️ Дамп чата {chat_id} получен с ВДС, но Telegram не принял файл. '
+             f'⚠️ Дамп чата {chat_id} получен с ВДС, но Telegram не принял файл.\n'
              f'Ответ: {str(res)[:300]}')
-    log_action(report_id, admin_id, 'view_messages',
-               'done' if ok else 'error: sendDocument')
+    log_action(report_id, admin_id, 'view_messages', 'done' if ok else 'error: sendDocument')
     return ok
 
 
 def run_bg(fn, *args, **kwargs):
-    """Фон: вебхук обязан ответить 200 за пару секунд, иначе gunicorn убьёт
-    воркер по timeout, а Telegram начнёт ретраить апдейт."""
-    t = threading.Thread(target=_bg_wrap, args=(fn, args, kwargs), daemon=True)
-    t.start()
+    """Вебхук обязан ответить 200 за пару секунд, иначе gunicorn убьёт воркер
+    по timeout, а Telegram начнёт ретраить апдейт по кругу."""
+    threading.Thread(target=_bg_wrap, args=(fn, args, kwargs), daemon=True).start()
 
 
 def _bg_wrap(fn, args, kwargs):
@@ -353,7 +398,8 @@ def _bg_wrap(fn, args, kwargs):
         fn(*args, **kwargs)
     except Exception as e:
         log.exception('фоновая задача упала: %s', e)
-        send(ADMIN_TELEGRAM_ID, f'❌ Внутренняя ошибка бота: {type(e).__name__}: {str(e)[:300]}')
+        send(ADMIN_TELEGRAM_ID,
+             f'❌ Внутренняя ошибка бота: {type(e).__name__}: {str(e)[:300]}')
 
 
 # ------------------------------------------------------- обработчики кнопок
@@ -370,12 +416,11 @@ def handle_messages_button(report_id, admin_id, callback_id, chat_id=''):
         log_action(report_id, admin_id, 'view_messages', 'error: no chat_id')
         send(ADMIN_TELEGRAM_ID,
              f'❌ У жалобы #{report_id or "—"} нет chat_id.\n\n'
-             'Причины: жалоба отправлена не из чата, или фронт не передал '
-             'chat_id в POST /report, или кнопка старая (создана до патча).\n\n'
-             'Можно выгрузить вручную: /dump <id чата>')
+             'Причины: жалоба отправлена не из чата, фронт не передал chat_id '
+             'в POST /report, или кнопка создана до патча.\n\n'
+             'Выгрузить вручную: /dump 29')
         return
 
-    # Отвечаем Telegram сразу, дальше работаем в фоне
     answer_callback(callback_id, 'Собираю переписку, файл придёт через пару секунд…',
                     alert=False)
     run_bg(deliver_dump, chat_id, report_id, admin_id)
@@ -390,28 +435,54 @@ def handle_ban_button(report_id, admin_id, callback_id):
 # --------------------------------------------------------------- вебхук
 
 def ensure_webhook():
-    """Ставит вебхук при старте. Без него callback_query от кнопок не приходит,
-    и кнопка выглядит «мёртвой», хотя жалобы через relay доходят нормально."""
+    """Ставит вебхук при старте. Без него callback_query от кнопок и команды
+    не приходят вообще, хотя жалобы через /relay/report доходят нормально."""
     if not BOT_TOKEN:
         return
     base = PUBLIC_URL
     if not base:
-        log.warning('PUBLIC_URL не задан — вебхук не выставлен, кнопки работать не будут. '
-                    'Открой /set_webhook?secret=<WEBHOOK_SECRET> вручную.')
+        log.warning('PUBLIC_URL не задан — вебхук не выставлен, кнопки работать '
+                    'не будут. Открой /set_webhook?secret=<WEBHOOK_SECRET>.')
         return
-    url = f'{base}/webhook/{WEBHOOK_SECRET}'
+    if not base.startswith('https://'):
+        base = 'https://' + base.split('://', 1)[-1]
+
+    url = f'{base}/webhook/{WEBHOOK_TOKEN}'
     try:
         info = requests.get(f'{TELEGRAM_API}/getWebhookInfo', timeout=10).json()
         current = ((info.get('result') or {}).get('url') or '')
         if current == url:
             log.info('вебхук уже стоит: %s', url)
             return
+        log.info('текущий вебхук %r -> ставлю %r', current, url)
     except Exception as e:
         log.error('getWebhookInfo: %s', e)
-    res = tg('setWebhook', url=url, secret_token=WEBHOOK_SECRET,
+
+    res = tg('setWebhook', url=url, secret_token=WEBHOOK_TOKEN,
              allowed_updates='["message","callback_query"]',
              drop_pending_updates='true')
-    log.info('setWebhook -> %s', res)
+    if res and res.get('ok'):
+        log.info('вебхук установлен: %s', url)
+        return
+
+    log.error('setWebhook НЕ УДАЛСЯ: %s', res)
+    desc = str((res or {}).get('description') or '')
+
+    # Фолбэк: если Telegram всё же ругается на secret_token — ставим без него.
+    # Защита остаётся за счёт секретного пути в URL.
+    if 'secret token' in desc.lower():
+        log.warning('повторяю setWebhook без secret_token')
+        res2 = tg('setWebhook', url=url,
+                  allowed_updates='["message","callback_query"]',
+                  drop_pending_updates='true')
+        if res2 and res2.get('ok'):
+            log.info('вебхук установлен без secret_token: %s', url)
+            return
+        log.error('повтор тоже не удался: %s', res2)
+
+    send(ADMIN_TELEGRAM_ID,
+         '⚠️ Вебхук не установился — кнопки и команды работать не будут.\n\n'
+         f'Telegram: {desc or res}\n\nURL: {url}')
 
 
 @app.before_request
@@ -421,9 +492,14 @@ def _ensure_init():
         return
     with _init_lock:
         if not _initialized:
-            init_db()
-            ensure_webhook()
             _initialized = True
+            # Сначала вебхук — он важнее и быстрее. БД поднимается в фоне,
+            # чтобы недоступная база не задерживала старт.
+            try:
+                ensure_webhook()
+            except Exception as e:
+                log.error('ensure_webhook: %s', e)
+            threading.Thread(target=_open_pool_bg, daemon=True).start()
 
 
 @app.route('/health', methods=['GET'])
@@ -437,17 +513,21 @@ def health():
         'vds_base_url': VDS_BASE_URL,
         'vds_admin_secret_set': bool(VDS_ADMIN_SECRET),
         'public_url_set': bool(PUBLIC_URL),
+        'webhook_secret_sanitized': WEBHOOK_TOKEN != WEBHOOK_SECRET,
+        'db': _pool_state,
         'time': datetime.now(timezone.utc).isoformat(),
     })
 
 
 @app.route('/webhook/<secret>', methods=['POST'])
 def webhook(secret):
-    if secret != WEBHOOK_SECRET:
+    if secret not in _VALID_WEBHOOK_PATHS:
+        log.warning('вебхук: неверный путь с %s', request.remote_addr)
         return jsonify({'ok': False}), 403
 
     header_token = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
-    if header_token and header_token != WEBHOOK_SECRET:
+    if header_token and header_token not in _VALID_HEADER_TOKENS:
+        log.warning('вебхук: неверный secret-token в заголовке')
         return jsonify({'ok': False}), 403
 
     update = request.get_json(silent=True) or {}
@@ -493,31 +573,35 @@ def webhook(secret):
             chat_id = (msg.get('chat') or {}).get('id')
             from_id = str((msg.get('from') or {}).get('id', ''))
             text = (msg.get('text') or '').strip()
+            log.info('message от %s: %s', from_id, text[:60])
 
             if text.startswith('/id'):
                 send(chat_id, f'Твой Telegram ID: {from_id}')
             elif from_id != ADMIN_TELEGRAM_ID:
                 send(chat_id, 'Этот бот служебный.')
-            elif text.startswith('/start'):
+            elif text.startswith('/start') or text.startswith('/help'):
                 send(chat_id, 'Бот жалоб на связи.\n\n'
                               '/diag — самопроверка\n'
-                              '/dump <id чата> — выгрузить переписку\n'
+                              '/dump 29 — выгрузить переписку чата 29\n'
                               '/last — последние жалобы')
             elif text.startswith('/last'):
-                send(chat_id, format_last_reports())
+                run_bg(lambda: send(chat_id, format_last_reports()))
             elif text.startswith('/diag'):
                 run_bg(send_diag, chat_id)
             elif text.startswith('/dump'):
+                # Терпим любой ввод: /dump 29, /dump <29>, /dump <id 29>
                 arg = re.sub(r'\D', '', text[5:])
                 if not arg:
-                    send(chat_id, 'Формат: /dump 123')
+                    send(chat_id, 'Формат: /dump 29 — только число, без <> и слова id')
                 else:
                     send(chat_id, f'Тяну чат {arg}…')
                     run_bg(deliver_dump, arg, None, from_id)
+            else:
+                send(chat_id, 'Не понял. Команды: /diag, /dump 29, /last')
         return jsonify({'ok': True})
     except Exception as e:
         log.exception('webhook: %s', e)
-        # Telegram всегда получает 200, иначе ретраит апдейт бесконечно
+        # Telegram всегда получает 200, иначе будет ретраить апдейт бесконечно
         return jsonify({'ok': True})
 
 
@@ -528,7 +612,13 @@ def send_diag(chat_id):
     lines.append(f'VDS_BASE_URL: {VDS_BASE_URL or "НЕ ЗАДАН"}')
     lines.append(f'VDS_ADMIN_SECRET: {"есть" if VDS_ADMIN_SECRET else "НЕТ"}')
     lines.append(f'RELAY_SECRET: {"есть" if RELAY_SECRET else "НЕТ"}')
-    lines.append(f'БД бота: {"подключена" if pool else "не подключена"}')
+    if WEBHOOK_TOKEN != WEBHOOK_SECRET:
+        lines.append('WEBHOOK_SECRET: содержал недопустимые символы, '
+                     'используется производный токен')
+    db_line = {'ok': 'подключена', 'pending': 'подключается…',
+               'disabled': 'не настроена (DATABASE_URL пуст)',
+               'error': f'ОШИБКА — {_pool_error}'}.get(_pool_state, _pool_state)
+    lines.append(f'БД бота: {db_line}')
     lines.append('')
 
     try:
@@ -555,7 +645,8 @@ def send_diag(chat_id):
 
 def format_last_reports(limit: int = 5) -> str:
     if not pool:
-        return 'БД не подключена (DATABASE_URL пуст) — список жалоб недоступен.'
+        return (f'БД недоступна ({_pool_state}: {_pool_error or "—"}).\n'
+                'Список жалоб не покажу, но выгрузка чата от БД не зависит: /dump 29')
     try:
         with pool.connection() as conn:
             rows = conn.execute(
@@ -628,22 +719,36 @@ def relay_report():
 
 @app.route('/set_webhook', methods=['GET', 'POST'])
 def set_webhook():
-    """/set_webhook?secret=WEBHOOK_SECRET"""
-    if request.args.get('secret', '') != WEBHOOK_SECRET:
+    """/set_webhook?secret=WEBHOOK_SECRET — принимает и сырой секрет, и токен."""
+    given = request.args.get('secret', '')
+    if given not in _VALID_WEBHOOK_PATHS:
         return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
     base = PUBLIC_URL or request.url_root.rstrip('/').replace('http://', 'https://')
-    url = f'{base}/webhook/{WEBHOOK_SECRET}'
-    res = tg('setWebhook', url=url, secret_token=WEBHOOK_SECRET,
+    url = f'{base}/webhook/{WEBHOOK_TOKEN}'
+    res = tg('setWebhook', url=url, secret_token=WEBHOOK_TOKEN,
              allowed_updates='["message","callback_query"]',
              drop_pending_updates='true')
+    if not (res and res.get('ok')):
+        res_no_token = tg('setWebhook', url=url,
+                          allowed_updates='["message","callback_query"]',
+                          drop_pending_updates='true')
+    else:
+        res_no_token = None
     try:
         info = requests.get(f'{TELEGRAM_API}/getWebhookInfo', timeout=10).json()
     except Exception as e:
         info = {'error': str(e)}
-    return jsonify({'requested_url': url, 'telegram': res, 'webhook_info': info})
+    return jsonify({
+        'requested_url': url,
+        'secret_was_sanitized': WEBHOOK_TOKEN != WEBHOOK_SECRET,
+        'telegram': res,
+        'telegram_retry_without_secret_token': res_no_token,
+        'webhook_info': info,
+    })
 
 
 if __name__ == '__main__':
-    init_db()
     ensure_webhook()
+    threading.Thread(target=_open_pool_bg, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5002)), debug=False)
