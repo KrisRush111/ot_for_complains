@@ -26,6 +26,7 @@ long-polling там засыпает/дублируется. Webhook + gunicorn 
 """
 
 import os
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -52,6 +53,11 @@ ADMIN_TELEGRAM_ID = str(os.environ.get('ADMIN_TELEGRAM_ID', '5574610358')).strip
 WEBHOOK_SECRET = os.environ.get('WEBHOOK_SECRET', 'change-me').strip()
 DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
 PUBLIC_URL = os.environ.get('PUBLIC_URL', '').strip().rstrip('/')
+
+# Общий секрет с ВДС: должен совпадать с REPORT_RELAY_SECRET на сервере.
+# Если пусто — relay открыт для всех, так лучше не оставлять.
+RELAY_SECRET = (os.environ.get('REPORT_RELAY_SECRET')
+                or os.environ.get('RELAY_SECRET') or '').strip()
 
 TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
@@ -200,6 +206,8 @@ def health():
         'status': 'ok',
         'service': 'new_bot',
         'bot_token': bool(BOT_TOKEN),
+        'relay': True,
+        'relay_secret_set': bool(RELAY_SECRET),
         'time': datetime.now(timezone.utc).isoformat(),
     })
 
@@ -281,6 +289,64 @@ def format_last_reports(limit: int = 5) -> str:
         )
     except Exception as e:
         return f'Ошибка БД: {e}'
+
+
+@app.route('/relay/report', methods=['POST'])
+def relay_report():
+    """
+    RELAY для ВДС из РФ, где api.telegram.org недоступен.
+
+    Сервер (server-for-vvv.py, _report_send_via_relay) шлёт сюда:
+        POST /relay/report
+        X-Relay-Secret: <REPORT_RELAY_SECRET>
+        {"report_id": 123, "text": "ПОСТУПИЛА ЖАЛОБА ..."}
+
+    Мы отправляем это админу в Telegram с теми же inline-кнопками
+    (rep:<id>:msgs / rep:<id>:ban) и возвращаем {"ok": true, "message_id": N}.
+    Формат ответа важен: сервер ждёт именно body['ok'] и body['message_id'].
+    """
+    if RELAY_SECRET:
+        if request.headers.get('X-Relay-Secret', '') != RELAY_SECRET:
+            log.warning('relay: неверный секрет с %s', request.remote_addr)
+            return jsonify({'ok': False, 'error': 'forbidden'}), 403
+
+    if not BOT_TOKEN:
+        return jsonify({'ok': False, 'error': 'no_bot_token'}), 500
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get('text') or '').strip()
+    if not text:
+        return jsonify({'ok': False, 'error': 'empty_text'}), 400
+
+    try:
+        rid = int(data.get('report_id') or 0)
+    except (TypeError, ValueError):
+        rid = 0
+
+    keyboard = {
+        'inline_keyboard': [[
+            {'text': 'сообщения чата', 'callback_data': f'rep:{rid}:msgs'},
+            {'text': 'отправить БАН', 'callback_data': f'rep:{rid}:ban'},
+        ]]
+    }
+
+    body = tg(
+        'sendMessage',
+        chat_id=ADMIN_TELEGRAM_ID,
+        text=text,
+        parse_mode='HTML',
+        disable_web_page_preview='true',
+        reply_markup=json.dumps(keyboard, ensure_ascii=False),
+    )
+
+    if not body or not body.get('ok'):
+        log.error('relay: sendMessage не ок: %s', body)
+        return jsonify({'ok': False, 'error': 'telegram_failed',
+                        'telegram': body}), 502
+
+    message_id = body['result']['message_id']
+    log.info('relay: жалоба #%s доставлена админу (message_id=%s)', rid, message_id)
+    return jsonify({'ok': True, 'message_id': message_id})
 
 
 @app.route('/set_webhook', methods=['GET', 'POST'])
