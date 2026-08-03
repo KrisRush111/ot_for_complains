@@ -59,6 +59,11 @@ PUBLIC_URL = os.environ.get('PUBLIC_URL', '').strip().rstrip('/')
 RELAY_SECRET = (os.environ.get('REPORT_RELAY_SECRET')
                 or os.environ.get('RELAY_SECRET') or '').strip()
 
+# Доступ к ВДС за выгрузкой переписки. Render -> ВДС по HTTPS работает
+# (заблокирован только путь ВДС -> api.telegram.org).
+VDS_BASE_URL = os.environ.get('VDS_BASE_URL', 'https://vuntserverrr.site').strip().rstrip('/')
+VDS_ADMIN_SECRET = os.environ.get('VDS_ADMIN_SECRET', '').strip()
+
 TELEGRAM_API = f'https://api.telegram.org/bot{BOT_TOKEN}'
 
 app = Flask(__name__)
@@ -177,14 +182,118 @@ def get_report(report_id):
 
 # ------------------------------------------------------- обработчики кнопок
 
-def handle_messages_button(report_id, admin_id, callback_id):
+def send_document(chat_id, filename: str, content: bytes, caption: str = ''):
+    """sendDocument multipart — файл с перепиской."""
+    if not BOT_TOKEN:
+        return None
+    try:
+        r = requests.post(
+            f'{TELEGRAM_API}/sendDocument',
+            data={
+                'chat_id': chat_id,
+                'caption': caption[:1000],
+                'parse_mode': 'HTML',
+            },
+            files={'document': (filename, content, 'text/html')},
+            timeout=60,
+        )
+        body = r.json() if r.content else {}
+        if not body.get('ok'):
+            log.error('sendDocument -> %s', body)
+        return body
+    except Exception as e:
+        log.error('sendDocument исключение: %s', e)
+        return None
+
+
+def fetch_chat_dump(chat_id):
     """
-    TODO (когда решишь включить): вытащить сообщения чата report['chat_id']
-    из основной БД / через служебный эндпоинт server-for-vvv и прислать сюда.
-    Сейчас — заглушка.
+    Забирает выгрузку переписки с ВДС.
+    Возвращает (html_bytes, stats_dict) или (None, error_text).
+
+    Почему через HTTP, а не напрямую из БД: сообщения лежат зашифрованными
+    (Fernet), а ключ FERNET_KEY есть только на ВДС. Расшифровать может
+    только он.
     """
-    log_action(report_id, admin_id, 'view_messages', 'pending')
-    answer_callback(callback_id, 'Сообщения чата: функция пока не подключена')
+    if not VDS_ADMIN_SECRET:
+        return None, 'VDS_ADMIN_SECRET не задан на Render'
+
+    url = f'{VDS_BASE_URL}/admin/chat_dump'
+    headers = {'X-Admin-Secret': VDS_ADMIN_SECRET}
+
+    try:
+        # Сначала JSON — из него берём счётчики для подписи к файлу
+        rj = requests.get(url, params={'chat_id': chat_id, 'format': 'json'},
+                          headers=headers, timeout=45)
+        if rj.status_code == 403:
+            return None, 'ВДС отклонил секрет (403). Сверь ADMIN_DUMP_SECRET и VDS_ADMIN_SECRET'
+        if rj.status_code == 404:
+            return None, f'Чат {chat_id} не найден в БД'
+        if not rj.ok:
+            return None, f'ВДС ответил {rj.status_code}'
+
+        payload = rj.json().get('chat') or {}
+        msgs = payload.get('messages') or []
+        stats = {
+            'total': len(msgs),
+            'deleted': sum(1 for m in msgs if m.get('deleted_by')),
+            'images': sum(1 for m in msgs if m.get('is_image')),
+            'participants': payload.get('participants') or [],
+        }
+
+        rh = requests.get(url, params={'chat_id': chat_id},
+                          headers=headers, timeout=45)
+        if not rh.ok:
+            return None, f'ВДС ответил {rh.status_code} на HTML'
+        return rh.content, stats
+    except requests.Timeout:
+        return None, 'ВДС не ответил за 45 секунд'
+    except Exception as e:
+        return None, f'{type(e).__name__}: {str(e)[:200]}'
+
+
+def handle_messages_button(report_id, admin_id, callback_id, chat_id=''):
+    """
+    Тянет с ВДС полную переписку чата (включая сообщения, удалённые
+    «только у себя») и присылает админу HTML-файлом.
+    """
+    # chat_id приходит из callback_data; если кнопка старая — пробуем БД
+    if not chat_id:
+        report = get_report(report_id)
+        chat_id = str((report or {}).get('chat_id') or '').strip()
+
+    if not chat_id or not chat_id.isdigit():
+        answer_callback(callback_id, 'В жалобе нет id чата — выгрузить нечего')
+        log_action(report_id, admin_id, 'view_messages', 'error: no chat_id')
+        return
+
+    answer_callback(callback_id, 'Собираю переписку, это займёт пару секунд…', alert=False)
+
+    content, info = fetch_chat_dump(chat_id)
+
+    if content is None:
+        log.error('dump чата %s не получен: %s', chat_id, info)
+        log_action(report_id, admin_id, 'view_messages', f'error: {info}'[:200])
+        send(ADMIN_TELEGRAM_ID, f'Не удалось выгрузить чат {chat_id}: {info}')
+        return
+
+    caption = (
+        f'💬 <b>Переписка чата {chat_id}</b>\n'
+        f'Жалоба #{report_id or "—"}\n\n'
+        f'Всего сообщений: <b>{info["total"]}</b>\n'
+        f'Удалено у кого-то: <b>{info["deleted"]}</b>\n'
+        f'Изображений: <b>{info["images"]}</b>\n\n'
+        'Открой файл — он отобразится как страница.'
+    )
+
+    res = send_document(
+        ADMIN_TELEGRAM_ID,
+        f'chat_{chat_id}.html',
+        content,
+        caption,
+    )
+    ok = bool(res and res.get('ok'))
+    log_action(report_id, admin_id, 'view_messages', 'done' if ok else 'error: sendDocument')
 
 
 def handle_ban_button(report_id, admin_id, callback_id):
@@ -236,12 +345,16 @@ def webhook(secret):
                 answer_callback(callback_id, 'Нет доступа')
                 return jsonify({'ok': True})
 
+            # Формат: rep:<report_id>:<action>[:<chat_id>]
+            # chat_id кладём прямо в кнопку — так бот не зависит от того,
+            # видит ли он ту же БД, в которую пишет ВДС.
             parts = data.split(':')
-            if len(parts) == 3 and parts[0] == 'rep':
+            if len(parts) >= 3 and parts[0] == 'rep':
                 report_id = int(parts[1]) if parts[1].isdigit() else None
                 action = parts[2]
+                cb_chat_id = parts[3] if len(parts) > 3 else ''
                 if action == 'msgs':
-                    handle_messages_button(report_id, from_id, callback_id)
+                    handle_messages_button(report_id, from_id, callback_id, cb_chat_id)
                 elif action == 'ban':
                     handle_ban_button(report_id, from_id, callback_id)
                 else:
@@ -323,10 +436,15 @@ def relay_report():
     except (TypeError, ValueError):
         rid = 0
 
+    # chat_id прокидываем в callback_data — лимит Telegram 64 байта,
+    # 'rep:<id>:msgs:<chat_id>' в него укладывается с запасом.
+    chat_ref = str(data.get('chat_id') or '').strip()[:20]
+    msgs_cb = f'rep:{rid}:msgs:{chat_ref}' if chat_ref else f'rep:{rid}:msgs'
+
     keyboard = {
         'inline_keyboard': [[
-            {'text': 'сообщения чата', 'callback_data': f'rep:{rid}:msgs'},
-            {'text': 'отправить БАН', 'callback_data': f'rep:{rid}:ban'},
+            {'text': '💬 сообщения чата', 'callback_data': msgs_cb},
+            {'text': '🚫 отправить БАН', 'callback_data': f'rep:{rid}:ban'},
         ]]
     }
 
