@@ -206,6 +206,23 @@ def send(chat_id, text: str, html: bool = False):
     tg('sendMessage', **kw)
 
 
+def send_keyboard(chat_id, text: str, keyboard: dict):
+    return tg('sendMessage', chat_id=chat_id, text=text[:4000],
+              parse_mode='HTML', disable_web_page_preview='true',
+              reply_markup=json.dumps(keyboard, ensure_ascii=False))
+
+
+def edit_keyboard(chat_id, message_id, text: str, keyboard: dict):
+    return tg('editMessageText', chat_id=chat_id, message_id=message_id,
+              text=text[:4000], parse_mode='HTML',
+              disable_web_page_preview='true',
+              reply_markup=json.dumps(keyboard, ensure_ascii=False))
+
+
+def delete_message(chat_id, message_id):
+    return tg('deleteMessage', chat_id=chat_id, message_id=message_id)
+
+
 def send_document(chat_id, filename: str, content: bytes,
                   caption: str = '', mime: str = 'text/html'):
     if not BOT_TOKEN:
@@ -429,10 +446,94 @@ def handle_messages_button(report_id, admin_id, callback_id, chat_id=''):
     run_bg(deliver_dump, chat_id, report_id, admin_id)
 
 
-def handle_ban_button(report_id, admin_id, callback_id):
-    """TODO: POST /admin/ban на ВДС с X-Admin-Secret и reported_id из жалобы."""
-    log_action(report_id, admin_id, 'ban', 'pending')
-    answer_callback(callback_id, 'Бан: функция пока не подключена')
+# ------------------------------------------------- меню срока бана (пока визуал)
+#
+# Навигация между экранами рабочая, сами сроки НИЧЕГО не делают — заглушка.
+# callback_data короткая (лимит Telegram — 64 байта):
+#   ban:<rid>:h   — экран «часы»
+#   ban:<rid>:d   — экран «дни»
+#   ban:<rid>:m   — экран «месяцы»
+#   ban:<rid>:x   — отмена (удаляет меню)
+#   bs:<rid>:<h1|d3|m2|perm> — выбор срока (заглушка)
+
+BAN_PROMPT = '⏳ <b>На какое время забанить пользователя?</b>'
+
+
+def _btn(text, data):
+    return {'text': text, 'callback_data': data}
+
+
+def ban_kb_hours(rid):
+    return {'inline_keyboard': [
+        [_btn('1 час', f'bs:{rid}:h1'), _btn('3 часа', f'bs:{rid}:h3'),
+         _btn('5 часов', f'bs:{rid}:h5')],
+        [_btn('7 часов', f'bs:{rid}:h7'), _btn('10 часов', f'bs:{rid}:h10'),
+         _btn('12 часов', f'bs:{rid}:h12')],
+        [_btn('✖️ отмена', f'ban:{rid}:x'), _btn('дни ▶️', f'ban:{rid}:d')],
+    ]}
+
+
+def ban_kb_days(rid):
+    return {'inline_keyboard': [
+        [_btn('1 день', f'bs:{rid}:d1'), _btn('3 дня', f'bs:{rid}:d3'),
+         _btn('5 дней', f'bs:{rid}:d5')],
+        [_btn('7 дней', f'bs:{rid}:d7'), _btn('10 дней', f'bs:{rid}:d10')],
+        [_btn('◀️ назад', f'ban:{rid}:h'), _btn('месяцы ▶️', f'ban:{rid}:m')],
+    ]}
+
+
+def ban_kb_months(rid):
+    return {'inline_keyboard': [
+        [_btn('1 месяц', f'bs:{rid}:m1'), _btn('2 месяца', f'bs:{rid}:m2'),
+         _btn('3 месяца', f'bs:{rid}:m3')],
+        [_btn('◀️ назад', f'ban:{rid}:d'), _btn('♾ НАВСЕГДА', f'bs:{rid}:perm')],
+    ]}
+
+
+BAN_SCREENS = {'h': ban_kb_hours, 'd': ban_kb_days, 'm': ban_kb_months}
+
+BAN_LABELS = {
+    'h1': '1 час', 'h3': '3 часа', 'h5': '5 часов', 'h7': '7 часов',
+    'h10': '10 часов', 'h12': '12 часов',
+    'd1': '1 день', 'd3': '3 дня', 'd5': '5 дней', 'd7': '7 дней',
+    'd10': '10 дней',
+    'm1': '1 месяц', 'm2': '2 месяца', 'm3': '3 месяца',
+    'perm': 'НАВСЕГДА',
+}
+
+
+def handle_ban_button(report_id, admin_id, callback_id, cq_chat_id=None):
+    """Открывает меню выбора срока. Сам бан пока не отправляется.
+    TODO: POST /admin/ban на ВДС с X-Admin-Secret и reported_id из жалобы."""
+    log_action(report_id, admin_id, 'ban', 'menu_opened')
+    answer_callback(callback_id, '', alert=False)
+    rid = report_id or 0
+    send_keyboard(cq_chat_id or ADMIN_TELEGRAM_ID,
+                  BAN_PROMPT + (f'\nЖалоба #{report_id}' if report_id else ''),
+                  ban_kb_hours(rid))
+
+
+def handle_ban_nav(rid, screen, callback_id, cq_chat_id, cq_msg_id):
+    """Переключение экранов часы/дни/месяцы и отмена."""
+    if screen == 'x':
+        answer_callback(callback_id, 'Отменено', alert=False)
+        delete_message(cq_chat_id, cq_msg_id)
+        return
+    kb = BAN_SCREENS.get(screen)
+    if not kb:
+        answer_callback(callback_id, f'Неизвестный экран: {screen}')
+        return
+    answer_callback(callback_id, '', alert=False)
+    edit_keyboard(cq_chat_id, cq_msg_id,
+                  BAN_PROMPT + (f'\nЖалоба #{rid}' if rid else ''), kb(rid))
+
+
+def handle_ban_pick(rid, code, admin_id, callback_id):
+    """Заглушка: срок выбран, но бан ещё не отправляется."""
+    label = BAN_LABELS.get(code, code)
+    log_action(rid or None, admin_id, f'ban_pick:{code}', 'not_implemented')
+    answer_callback(callback_id,
+                    f'Выбрано: {label}\n\nБан пока не подключён — это визуал.')
 
 
 # --------------------------------------------------------------- вебхук
@@ -555,8 +656,20 @@ def webhook(secret):
                 answer_callback(callback_id, 'Нет доступа')
                 return jsonify({'ok': True})
 
+            cq_msg = cq.get('message') or {}
+            cq_chat_id = (cq_msg.get('chat') or {}).get('id') or ADMIN_TELEGRAM_ID
+            cq_msg_id = cq_msg.get('message_id')
+
             # Формат: rep:<report_id>:<action>[:<chat_id>]
             parts = data.split(':')
+            if len(parts) == 3 and parts[0] == 'ban':
+                rid = int(parts[1]) if parts[1].isdigit() else 0
+                handle_ban_nav(rid, parts[2], callback_id, cq_chat_id, cq_msg_id)
+                return jsonify({'ok': True})
+            if len(parts) == 3 and parts[0] == 'bs':
+                rid = int(parts[1]) if parts[1].isdigit() else 0
+                handle_ban_pick(rid, parts[2], from_id, callback_id)
+                return jsonify({'ok': True})
             if len(parts) >= 3 and parts[0] == 'rep':
                 report_id = int(parts[1]) if parts[1].isdigit() else None
                 action = parts[2]
@@ -564,7 +677,7 @@ def webhook(secret):
                 if action == 'msgs':
                     handle_messages_button(report_id, from_id, callback_id, cb_chat_id)
                 elif action == 'ban':
-                    handle_ban_button(report_id, from_id, callback_id)
+                    handle_ban_button(report_id, from_id, callback_id, cq_chat_id)
                 else:
                     answer_callback(callback_id, f'Неизвестное действие: {action}')
             else:
