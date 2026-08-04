@@ -215,7 +215,7 @@ def send_document(chat_id, filename: str, content: bytes,
             f'{TELEGRAM_API}/sendDocument',
             data={'chat_id': chat_id, 'caption': caption[:1000], 'parse_mode': 'HTML'},
             files={'document': (filename, io.BytesIO(content), mime)},
-            timeout=90,
+            timeout=180,
         )
         body = r.json() if r.content else {}
         if not body.get('ok'):
@@ -304,13 +304,15 @@ def fetch_chat_dump(chat_id):
             'json': payload,
         }
 
+        # html теперь тяжелее: ВДС качает фото с Cloudinary и вшивает их в файл
         rh = requests.get(url, params={'chat_id': chat_id},
-                          headers=headers, timeout=30)
+                          headers=headers, timeout=180)
         if not rh.ok:
             return None, f'ВДС ответил {rh.status_code} на HTML-выгрузку'
         return rh.content, stats
     except requests.Timeout:
-        return None, 'ВДС не ответил за 30 секунд (сервер или БД тормозит/лежит)'
+        return None, ('ВДС не ответил вовремя. Если в чате много фото, сборка отчёта\n'
+                      'может быть долгой — попробуй ещё раз.')
     except requests.ConnectionError as e:
         return None, (f'Не достучался до {VDS_BASE_URL}: {str(e)[:180]}\n'
                       'Проверь домен, HTTPS-сертификат и что сервер запущен.')
@@ -321,7 +323,7 @@ def fetch_chat_dump(chat_id):
 def dump_to_text(payload) -> bytes:
     """Плоская .txt-копия: мобильный Telegram HTML-файл не превьюит, только
     скачивает, а .txt открывает прямо в приложении."""
-    lines = [f'Переписка чата #{payload.get("chat_id")}',
+    lines = [f'Отчёт по чату #{payload.get("chat_id")}',
              f'Создан: {payload.get("created_at")}',
              'Участники:']
     for p in payload.get('participants') or []:
@@ -358,30 +360,31 @@ def deliver_dump(chat_id, report_id=None, admin_id=ADMIN_TELEGRAM_ID):
     if content is None:
         log.error('dump чата %s не получен: %s', chat_id, info)
         log_action(report_id, admin_id, 'view_messages', f'error: {info}'[:200])
-        send(ADMIN_TELEGRAM_ID, f'❌ Не удалось выгрузить чат {chat_id}\n\n{info}')
+        send(ADMIN_TELEGRAM_ID, f'❌ Не удалось собрать отчёт по чату {chat_id}\n\n{info}')
         return False
 
     caption = (
-        f'💬 <b>Переписка чата {chat_id}</b>\n'
+        f'📄 <b>Отчёт по чату {chat_id}</b>\n'
         + (f'Жалоба #{report_id}\n' if report_id else '')
         + f'\nВсего сообщений: <b>{info["total"]}</b>\n'
           f'Удалено у кого-то: <b>{info["deleted"]}</b>\n'
           f'Изображений: <b>{info["images"]}</b>\n\n'
-          '.html — открывается в браузере, .txt — прямо в Telegram.'
+          '.html — фото уже внутри файла, открывать в браузере.\n'
+          '.txt — быстрый просмотр текста прямо в Telegram.'
     )
 
-    res = send_document(ADMIN_TELEGRAM_ID, f'chat_{chat_id}.html', content, caption)
+    res = send_document(ADMIN_TELEGRAM_ID, f'report_{chat_id}.html', content, caption)
     ok = bool(res and res.get('ok'))
 
     try:
         txt = dump_to_text(info.get('json') or {})
-        send_document(ADMIN_TELEGRAM_ID, f'chat_{chat_id}.txt', txt, '', mime='text/plain')
+        send_document(ADMIN_TELEGRAM_ID, f'report_{chat_id}.txt', txt, '', mime='text/plain')
     except Exception as e:
         log.error('txt-копия не собралась: %s', e)
 
     if not ok:
         send(ADMIN_TELEGRAM_ID,
-             f'⚠️ Дамп чата {chat_id} получен с ВДС, но Telegram не принял файл.\n'
+             f'⚠️ Отчёт по чату {chat_id} получен с ВДС, но Telegram не принял файл.\n'
              f'Ответ: {str(res)[:300]}')
     log_action(report_id, admin_id, 'view_messages', 'done' if ok else 'error: sendDocument')
     return ok
@@ -693,7 +696,7 @@ def relay_report():
 
     keyboard = {
         'inline_keyboard': [[
-            {'text': '💬 сообщения чата', 'callback_data': msgs_cb},
+            {'text': '📄 отчёт', 'callback_data': msgs_cb},
             {'text': '🚫 отправить БАН', 'callback_data': f'rep:{rid}:ban'},
         ]]
     }
