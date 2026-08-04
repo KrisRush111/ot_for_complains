@@ -562,11 +562,16 @@ def time_prompt(rid, nick):
     return head + (f'\nЖалоба #{rid}' if rid else '')
 
 
-def resolve_users(rid, chat_ref):
+def resolve_users(rid, chat_ref, why=None):
     """Участники чата: сначала жалоба в БД, потом выгрузка с ВДС.
-    Вызывать только из фонового потока — оба источника сетевые."""
+    Вызывать только из фонового потока — оба источника сетевые.
+    why — список, куда пишем причины неудачи для сообщения админу."""
+    why = why if why is not None else []
     users = []
     rep = get_report(rid) if rid else None
+    if not rep:
+        why.append(f'• жалоба #{rid or "—"} не читается из БД бота '
+                   f'(состояние: {_pool_state}{": " + _pool_error if _pool_error else ""})')
     if rep:
         for uid, nick in ((rep.get('reported_id'), rep.get('reported_nickname')),
                           (rep.get('reporter_id'), None)):
@@ -575,13 +580,19 @@ def resolve_users(rid, chat_ref):
         if not chat_ref:
             chat_ref = re.sub(r'\D', '', str(rep.get('chat_id') or ''))
 
+    if not users and not chat_ref:
+        why.append('• в жалобе нет chat_id, поэтому участников не спросить у ВДС')
+
     if not users and chat_ref:
         content, info = fetch_chat_dump(chat_ref)
         if content is not None:
             for p in (info.get('participants') or []):
                 users.append({'id': str(p.get('user_id')),
                               'nick': p.get('nickname') or f'id {p.get("user_id")}'})
+            if not users:
+                why.append(f'• ВДС отдал чат {chat_ref} без участников')
         else:
+            why.append(f'• ВДС не дал участников чата {chat_ref}: {info}')
             log.warning('resolve_users: ВДС не дал участников чата %s: %s',
                         chat_ref, info)
 
@@ -597,12 +608,16 @@ def open_user_screen(rid, admin_id, chat_id, message_id, orig_text, chat_ref,
                      users=None):
     """Меняет текст жалобы на выбор пользователя. Фоновый поток: если участники
     не пришли вместе с жалобой, их приходится тянуть из БД или с ВДС."""
-    users = users or resolve_users(rid, chat_ref)
+    why = []
+    users = users or resolve_users(rid, chat_ref, why)
     if not users:
         edit_keyboard(chat_id, message_id, orig_text, report_kb(rid, chat_ref))
         send(ADMIN_TELEGRAM_ID,
-             f'❌ Не удалось определить участников жалобы #{rid or "—"}.\n'
-             'Нужны reported_id/reporter_id в жалобе, рабочая БД или доступный ВДС.')
+             f'❌ Не удалось определить участников жалобы #{rid or "—"}.\n\n'
+             + ('\n'.join(why) if why else '• источники не вернули данных')
+             + '\n\nСамое надёжное — чтобы ВДС передавал в POST /relay/report '
+               'поля reported_id, reported_nickname, reporter_id, '
+               'reporter_nickname и participants: тогда БД и ВДС не нужны.')
         return
     ban_state_put(chat_id, message_id, rid=rid, chat_ref=chat_ref,
                   text=orig_text, users=users, target=None)
