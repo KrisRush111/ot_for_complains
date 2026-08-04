@@ -446,21 +446,71 @@ def handle_messages_button(report_id, admin_id, callback_id, chat_id=''):
     run_bg(deliver_dump, chat_id, report_id, admin_id)
 
 
-# ------------------------------------------------- меню срока бана (пока визуал)
+# ------------------------------------------------- меню бана (пока визуал)
 #
-# Навигация между экранами рабочая, сами сроки НИЧЕГО не делают — заглушка.
-# callback_data короткая (лимит Telegram — 64 байта):
+# Сообщение с жалобой НЕ дублируется новым: экраны меняют текст и клавиатуру
+# того же сообщения через editMessageText. Сценарий:
+#   жалоба -> «Кому из пользователей отправить?» -> «На какое время забанить
+#   пользователя "ник"?» (часы -> дни -> месяцы) -> заглушка выбора.
+#
+# «отмена» возвращает исходный текст жалобы с исходными кнопками, поэтому
+# оригинал сообщения хранится в _BAN_STATE.
+#
+# callback_data (лимит Telegram — 64 байта, поэтому только индексы и коды):
+#   ban:<rid>:u   — экран выбора пользователя
 #   ban:<rid>:h   — экран «часы»
 #   ban:<rid>:d   — экран «дни»
 #   ban:<rid>:m   — экран «месяцы»
-#   ban:<rid>:x   — отмена (удаляет меню)
-#   bs:<rid>:<h1|d3|m2|perm> — выбор срока (заглушка)
+#   ban:<rid>:x   — отмена, вернуть жалобу
+#   bu:<rid>:<idx>            — выбран пользователь по индексу в _BAN_STATE
+#   bs:<rid>:<h1|d3|m2|perm>  — выбран срок (заглушка)
 
-BAN_PROMPT = '⏳ <b>На какое время забанить пользователя?</b>'
+USER_PROMPT = '👤 <b>Кому из пользователей отправить?</b>'
+
+# Состояние по сообщению: оригинал жалобы + участники + выбранная цель.
+# Память процесса: после рестарта Render меню на старом сообщении не сможет
+# восстановить текст жалобы — тогда покажем короткую заглушку вместо неё.
+_BAN_STATE = {}
+_ban_lock = threading.Lock()
+
+
+def _mkey(chat_id, message_id):
+    return f'{chat_id}:{message_id}'
+
+
+def ban_state_put(chat_id, message_id, **fields):
+    key = _mkey(chat_id, message_id)
+    with _ban_lock:
+        st = _BAN_STATE.setdefault(key, {})
+        st.update(fields)
+        if len(_BAN_STATE) > 300:
+            for k in list(_BAN_STATE)[:100]:
+                _BAN_STATE.pop(k, None)
+        return st
+
+
+def ban_state_get(chat_id, message_id):
+    with _ban_lock:
+        return dict(_BAN_STATE.get(_mkey(chat_id, message_id)) or {})
 
 
 def _btn(text, data):
     return {'text': text, 'callback_data': data}
+
+
+def report_kb(rid, chat_ref=''):
+    """Исходная клавиатура под жалобой — нужна и для relay, и для отмены."""
+    msgs_cb = f'rep:{rid}:msgs:{chat_ref}' if chat_ref else f'rep:{rid}:msgs'
+    return {'inline_keyboard': [[
+        _btn('📄 отчёт', msgs_cb),
+        _btn('🚫 отправить БАН', f'rep:{rid}:ban'),
+    ]]}
+
+
+def ban_kb_users(rid, users):
+    rows = [[_btn(u['nick'], f'bu:{rid}:{i}')] for i, u in enumerate(users)]
+    rows.append([_btn('✖️ отмена', f'ban:{rid}:x')])
+    return {'inline_keyboard': rows}
 
 
 def ban_kb_hours(rid):
@@ -502,38 +552,130 @@ BAN_LABELS = {
 }
 
 
-def handle_ban_button(report_id, admin_id, callback_id, cq_chat_id=None):
-    """Открывает меню выбора срока. Сам бан пока не отправляется.
-    TODO: POST /admin/ban на ВДС с X-Admin-Secret и reported_id из жалобы."""
-    log_action(report_id, admin_id, 'ban', 'menu_opened')
-    answer_callback(callback_id, '', alert=False)
+def _esc(s):
+    return (str(s or '').replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;'))
+
+
+def time_prompt(rid, nick):
+    head = f'⏳ <b>На какое время забанить пользователя "{_esc(nick)}"?</b>'
+    return head + (f'\nЖалоба #{rid}' if rid else '')
+
+
+def resolve_users(rid, chat_ref):
+    """Участники чата: сначала жалоба в БД, потом выгрузка с ВДС.
+    Вызывать только из фонового потока — оба источника сетевые."""
+    users = []
+    rep = get_report(rid) if rid else None
+    if rep:
+        for uid, nick in ((rep.get('reported_id'), rep.get('reported_nickname')),
+                          (rep.get('reporter_id'), None)):
+            if uid:
+                users.append({'id': str(uid), 'nick': nick or f'id {uid}'})
+        if not chat_ref:
+            chat_ref = re.sub(r'\D', '', str(rep.get('chat_id') or ''))
+
+    if not users and chat_ref:
+        content, info = fetch_chat_dump(chat_ref)
+        if content is not None:
+            for p in (info.get('participants') or []):
+                users.append({'id': str(p.get('user_id')),
+                              'nick': p.get('nickname') or f'id {p.get("user_id")}'})
+        else:
+            log.warning('resolve_users: ВДС не дал участников чата %s: %s',
+                        chat_ref, info)
+
+    seen, out = set(), []
+    for u in users:
+        if u['id'] and u['id'] not in seen:
+            seen.add(u['id'])
+            out.append(u)
+    return out
+
+
+def open_user_screen(rid, admin_id, chat_id, message_id, orig_text, chat_ref,
+                     users=None):
+    """Меняет текст жалобы на выбор пользователя. Фоновый поток: если участники
+    не пришли вместе с жалобой, их приходится тянуть из БД или с ВДС."""
+    users = users or resolve_users(rid, chat_ref)
+    if not users:
+        edit_keyboard(chat_id, message_id, orig_text, report_kb(rid, chat_ref))
+        send(ADMIN_TELEGRAM_ID,
+             f'❌ Не удалось определить участников жалобы #{rid or "—"}.\n'
+             'Нужны reported_id/reporter_id в жалобе, рабочая БД или доступный ВДС.')
+        return
+    ban_state_put(chat_id, message_id, rid=rid, chat_ref=chat_ref,
+                  text=orig_text, users=users, target=None)
+    log_action(rid or None, admin_id, 'ban', 'user_screen')
+    edit_keyboard(chat_id, message_id, USER_PROMPT, ban_kb_users(rid, users))
+
+
+def handle_ban_button(report_id, admin_id, callback_id, cq_chat_id,
+                      cq_msg_id, cq_msg=None, chat_ref=''):
+    """Нажат «🚫 отправить БАН» под жалобой — сообщение жалобы превращается
+    в экран выбора пользователя. Ничего нового не отправляется."""
     rid = report_id or 0
-    send_keyboard(cq_chat_id or ADMIN_TELEGRAM_ID,
-                  BAN_PROMPT + (f'\nЖалоба #{report_id}' if report_id else ''),
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+    orig = st.get('text') or (cq_msg or {}).get('text') or 'Жалоба'
+    chat_ref = chat_ref or st.get('chat_ref') or ''
+    answer_callback(callback_id, '', alert=False)
+    run_bg(open_user_screen, rid, admin_id, cq_chat_id, cq_msg_id, orig, chat_ref,
+           st.get('users') or None)
+
+
+def handle_ban_user_pick(rid, idx, admin_id, callback_id, cq_chat_id, cq_msg_id):
+    """Пользователь выбран — тот же экран становится выбором срока."""
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+    users = st.get('users') or []
+    if idx < 0 or idx >= len(users):
+        answer_callback(callback_id, 'Меню устарело — нажми «отправить БАН» заново')
+        return
+    target = users[idx]
+    ban_state_put(cq_chat_id, cq_msg_id, target=target)
+    log_action(rid or None, admin_id, f'ban_target:{target["id"]}', 'time_screen')
+    answer_callback(callback_id, '', alert=False)
+    edit_keyboard(cq_chat_id, cq_msg_id, time_prompt(rid, target['nick']),
                   ban_kb_hours(rid))
 
 
 def handle_ban_nav(rid, screen, callback_id, cq_chat_id, cq_msg_id):
-    """Переключение экранов часы/дни/месяцы и отмена."""
+    """Отмена и переключение часы/дни/месяцы — всё в одном сообщении."""
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+
     if screen == 'x':
         answer_callback(callback_id, 'Отменено', alert=False)
-        delete_message(cq_chat_id, cq_msg_id)
+        edit_keyboard(cq_chat_id, cq_msg_id,
+                      st.get('text') or f'Жалоба #{rid or "—"}',
+                      report_kb(rid, st.get('chat_ref') or ''))
         return
+
+    if screen == 'u':
+        users = st.get('users') or []
+        if not users:
+            answer_callback(callback_id, 'Меню устарело — нажми «отправить БАН» заново')
+            return
+        answer_callback(callback_id, '', alert=False)
+        edit_keyboard(cq_chat_id, cq_msg_id, USER_PROMPT, ban_kb_users(rid, users))
+        return
+
     kb = BAN_SCREENS.get(screen)
     if not kb:
         answer_callback(callback_id, f'Неизвестный экран: {screen}')
         return
+    nick = (st.get('target') or {}).get('nick') or '—'
     answer_callback(callback_id, '', alert=False)
-    edit_keyboard(cq_chat_id, cq_msg_id,
-                  BAN_PROMPT + (f'\nЖалоба #{rid}' if rid else ''), kb(rid))
+    edit_keyboard(cq_chat_id, cq_msg_id, time_prompt(rid, nick), kb(rid))
 
 
-def handle_ban_pick(rid, code, admin_id, callback_id):
-    """Заглушка: срок выбран, но бан ещё не отправляется."""
+def handle_ban_pick(rid, code, admin_id, callback_id, cq_chat_id, cq_msg_id):
+    """Заглушка: срок выбран, бан пока не отправляется.
+    TODO: POST /admin/ban на ВДС с X-Admin-Secret, target['id'] и сроком."""
     label = BAN_LABELS.get(code, code)
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+    nick = (st.get('target') or {}).get('nick') or '—'
     log_action(rid or None, admin_id, f'ban_pick:{code}', 'not_implemented')
     answer_callback(callback_id,
-                    f'Выбрано: {label}\n\nБан пока не подключён — это визуал.')
+                    f'{nick} — {label}\n\nБан пока не подключён, это визуал.')
 
 
 # --------------------------------------------------------------- вебхук
@@ -668,7 +810,14 @@ def webhook(secret):
                 return jsonify({'ok': True})
             if len(parts) == 3 and parts[0] == 'bs':
                 rid = int(parts[1]) if parts[1].isdigit() else 0
-                handle_ban_pick(rid, parts[2], from_id, callback_id)
+                handle_ban_pick(rid, parts[2], from_id, callback_id,
+                                cq_chat_id, cq_msg_id)
+                return jsonify({'ok': True})
+            if len(parts) == 3 and parts[0] == 'bu':
+                rid = int(parts[1]) if parts[1].isdigit() else 0
+                idx = int(parts[2]) if parts[2].isdigit() else -1
+                handle_ban_user_pick(rid, idx, from_id, callback_id,
+                                     cq_chat_id, cq_msg_id)
                 return jsonify({'ok': True})
             if len(parts) >= 3 and parts[0] == 'rep':
                 report_id = int(parts[1]) if parts[1].isdigit() else None
@@ -677,7 +826,8 @@ def webhook(secret):
                 if action == 'msgs':
                     handle_messages_button(report_id, from_id, callback_id, cb_chat_id)
                 elif action == 'ban':
-                    handle_ban_button(report_id, from_id, callback_id, cq_chat_id)
+                    handle_ban_button(report_id, from_id, callback_id, cq_chat_id,
+                                      cq_msg_id, cq_msg, cb_chat_id)
                 else:
                     answer_callback(callback_id, f'Неизвестное действие: {action}')
             else:
@@ -802,17 +952,26 @@ def relay_report():
         rid = 0
 
     chat_ref = re.sub(r'\D', '', str(data.get('chat_id') or ''))[:20]
-    msgs_cb = f'rep:{rid}:msgs:{chat_ref}' if chat_ref else f'rep:{rid}:msgs'
     if not chat_ref:
         log.warning('relay: жалоба #%s пришла без chat_id — кнопка выгрузки '
                     'сможет опереться только на БД', rid)
 
-    keyboard = {
-        'inline_keyboard': [[
-            {'text': '📄 отчёт', 'callback_data': msgs_cb},
-            {'text': '🚫 отправить БАН', 'callback_data': f'rep:{rid}:ban'},
-        ]]
-    }
+    # Участники прямо из жалобы: тогда экран «кому отправить» открывается
+    # мгновенно, без запроса в БД и на ВДС.
+    users = []
+    for uid_key, nick_key in (('reported_id', 'reported_nickname'),
+                              ('reporter_id', 'reporter_nickname')):
+        uid = str(data.get(uid_key) or '').strip()
+        if uid:
+            users.append({'id': uid,
+                          'nick': str(data.get(nick_key) or '').strip() or f'id {uid}'})
+    for p in (data.get('participants') or []):
+        uid = str((p or {}).get('user_id') or (p or {}).get('id') or '').strip()
+        if uid and uid not in {u['id'] for u in users}:
+            users.append({'id': uid,
+                          'nick': str((p or {}).get('nickname') or '').strip() or f'id {uid}'})
+
+    keyboard = report_kb(rid, chat_ref)
 
     body = tg(
         'sendMessage',
@@ -828,6 +987,12 @@ def relay_report():
         return jsonify({'ok': False, 'error': 'telegram_failed', 'telegram': body}), 502
 
     message_id = body['result']['message_id']
+    # Оригинал жалобы нужен, чтобы «отмена» вернула сообщение как было —
+    # меню бана редактирует это же сообщение, а не отправляет новое.
+    ban_state_put(int(ADMIN_TELEGRAM_ID) if ADMIN_TELEGRAM_ID.isdigit()
+                  else ADMIN_TELEGRAM_ID, message_id,
+                  rid=rid, chat_ref=chat_ref, text=text,
+                  users=users, target=None)
     log.info('relay: жалоба #%s доставлена (message_id=%s, chat_id=%s)',
              rid, message_id, chat_ref or '—')
     return jsonify({'ok': True, 'message_id': message_id})
