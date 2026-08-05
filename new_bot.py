@@ -682,15 +682,193 @@ def handle_ban_nav(rid, screen, callback_id, cq_chat_id, cq_msg_id):
     edit_keyboard(cq_chat_id, cq_msg_id, time_prompt(rid, nick), kb(rid))
 
 
-def handle_ban_pick(rid, code, admin_id, callback_id, cq_chat_id, cq_msg_id):
-    """Заглушка: срок выбран, бан пока не отправляется.
-    TODO: POST /admin/ban на ВДС с X-Admin-Secret, target['id'] и сроком."""
+def vds_post(path, payload):
+    """POST на ВДС с админским секретом. (ok: bool, данные_или_текст_ошибки)."""
+    if not VDS_ADMIN_SECRET:
+        return False, ('VDS_ADMIN_SECRET не задан в переменных Render.\n'
+                       'Он должен совпадать с ADMIN_DUMP_SECRET в .env на ВДС.')
+    if not VDS_BASE_URL:
+        return False, 'VDS_BASE_URL не задан в переменных Render'
+    try:
+        r = requests.post(f'{VDS_BASE_URL}{path}',
+                          json=payload,
+                          headers={'X-Admin-Secret': VDS_ADMIN_SECRET},
+                          timeout=20)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code == 200 and body.get('success'):
+            return True, body
+        return False, (f'ВДС ответил {r.status_code}: '
+                       f'{body.get("error") or r.text[:200]}')
+    except Exception as e:
+        return False, f'{type(e).__name__}: {str(e)[:200]}'
+
+
+def vds_get(path, params):
+    if not VDS_ADMIN_SECRET or not VDS_BASE_URL:
+        return False, 'VDS_ADMIN_SECRET / VDS_BASE_URL не заданы на Render'
+    try:
+        r = requests.get(f'{VDS_BASE_URL}{path}', params=params,
+                         headers={'X-Admin-Secret': VDS_ADMIN_SECRET}, timeout=20)
+        body = r.json() if r.content else {}
+        if r.status_code == 200 and body.get('success'):
+            return True, body
+        return False, f'ВДС ответил {r.status_code}: {body.get("error") or r.text[:200]}'
+    except Exception as e:
+        return False, f'{type(e).__name__}: {str(e)[:200]}'
+
+
+def _fmt_until(iso_str):
+    """'2026-08-07T14:32:11+00:00' -> '07.08.2026 14:32 UTC'."""
+    if not iso_str:
+        return 'навсегда'
+    try:
+        dt = datetime.fromisoformat(str(iso_str).replace('Z', '+00:00'))
+        return dt.astimezone(timezone.utc).strftime('%d.%m.%Y %H:%M UTC')
+    except Exception:
+        return str(iso_str)
+
+
+def unban_kb(rid, user_id):
+    """Кнопка отмены под подтверждением бана — на случай, если бан отправлен
+    случайно. Снятие доходит до пользователя в реальном времени."""
+    return {'inline_keyboard': [[
+        _btn('♻️ ОТМЕНИТЬ БАН', f'ub:{rid}:{user_id}'),
+    ]]}
+
+
+def _do_ban(rid, code, admin_id, cq_chat_id, cq_msg_id, target):
+    """Фоновый поток: POST /admin/ban на ВДС и правка того же сообщения."""
     label = BAN_LABELS.get(code, code)
+    nick = target.get('nick') or f'id {target.get("id")}'
+    ok, res = vds_post('/admin/ban', {
+        'user_id': target['id'],
+        'duration': code,
+        'reason': f'Жалоба #{rid}' if rid else 'Решение модератора',
+        'report_id': rid or None,
+        'admin_id': str(admin_id),
+    })
+
+    if not ok:
+        log_action(rid or None, admin_id, f'ban_pick:{code}', f'error: {res}'[:200])
+        st = ban_state_get(cq_chat_id, cq_msg_id)
+        edit_keyboard(cq_chat_id, cq_msg_id,
+                      f'❌ <b>Бан НЕ выдан</b>\nПользователь: {_esc(nick)} — {_esc(label)}\n\n'
+                      f'{_esc(res)}',
+                      report_kb(rid, st.get('chat_ref') or ''))
+        return
+
+    log_action(rid or None, admin_id, f'ban_pick:{code}', f'banned:{target["id"]}')
+    permanent = bool(res.get('is_permanent'))
+    lines = [
+        '🚫 <b>БАН ВЫДАН</b>',
+        '',
+        f'Пользователь: <b>{_esc(nick)}</b> (id {_esc(target["id"])})',
+        f'Срок: <b>{_esc(label)}</b>',
+    ]
+    if not permanent:
+        lines.append(f'Истекает: {_esc(_fmt_until(res.get("expires_at")))}')
+    else:
+        lines.append('Истекает: <b>никогда</b>')
+    if rid:
+        lines.append(f'Жалоба #{rid}')
+    lines += ['', 'Пользователь уже видит экран блокировки — страницы платформы '
+                  'заблокированы, из аккаунта его не выкидывало.']
+    edit_keyboard(cq_chat_id, cq_msg_id, '\n'.join(lines),
+                  unban_kb(rid, target['id']))
+
+
+def handle_ban_pick(rid, code, admin_id, callback_id, cq_chat_id, cq_msg_id):
+    """Срок выбран — реально отправляем бан на ВДС."""
     st = ban_state_get(cq_chat_id, cq_msg_id)
-    nick = (st.get('target') or {}).get('nick') or '—'
-    log_action(rid or None, admin_id, f'ban_pick:{code}', 'not_implemented')
-    answer_callback(callback_id,
-                    f'{nick} — {label}\n\nБан пока не подключён, это визуал.')
+    target = st.get('target') or {}
+    if not target.get('id'):
+        answer_callback(callback_id, 'Меню устарело — нажми «отправить БАН» заново')
+        return
+    answer_callback(callback_id, '', alert=False)
+    edit_keyboard(cq_chat_id, cq_msg_id,
+                  f'⏳ Отправляю бан {_esc(target.get("nick") or target["id"])} — '
+                  f'{_esc(BAN_LABELS.get(code, code))}…', {'inline_keyboard': []})
+    run_bg(_do_ban, rid, code, admin_id, cq_chat_id, cq_msg_id, target)
+
+
+def _do_unban(rid, user_id, admin_id, cq_chat_id, cq_msg_id, orig_text):
+    ok, res = vds_post('/admin/unban', {'user_id': str(user_id),
+                                        'admin_id': str(admin_id)})
+    if not ok:
+        log_action(rid or None, admin_id, f'unban:{user_id}', f'error: {res}'[:200])
+        edit_keyboard(cq_chat_id, cq_msg_id,
+                      orig_text + f'\n\n❌ Снять бан не удалось: {_esc(res)}',
+                      unban_kb(rid, user_id))
+        return
+    log_action(rid or None, admin_id, f'unban:{user_id}', 'lifted')
+    edit_keyboard(cq_chat_id, cq_msg_id,
+                  f'♻️ <b>БАН СНЯТ</b>\n\nПользователь id {_esc(user_id)} снова '
+                  f'пользуется платформой — блокировка у него исчезла сразу, '
+                  f'без перезагрузки страницы.'
+                  + (f'\nЖалоба #{rid}' if rid else ''),
+                  {'inline_keyboard': []})
+
+
+def handle_unban_button(rid, user_id, admin_id, callback_id, cq_chat_id, cq_msg_id,
+                        cq_msg=None):
+    """Нажата «♻️ ОТМЕНИТЬ БАН» под подтверждением бана."""
+    orig = (cq_msg or {}).get('text') or 'Бан'
+    answer_callback(callback_id, '', alert=False)
+    run_bg(_do_unban, rid, user_id, admin_id, cq_chat_id, cq_msg_id, _esc(orig))
+
+
+# ------------------------------------------------ текстовые команды бана
+
+def cmd_ban(chat_id, user_id, code, admin_id):
+    """Бан вручную, без жалобы: /ban 123 d3"""
+    if code not in BAN_LABELS:
+        send(chat_id, f'Неизвестный код срока: {code}\n\nДоступно: '
+                      + ', '.join(BAN_LABELS.keys()))
+        return
+    ok, res = vds_post('/admin/ban', {
+        'user_id': str(user_id), 'duration': code,
+        'reason': 'Решение модератора', 'admin_id': str(admin_id),
+    })
+    if not ok:
+        send(chat_id, f'❌ Бан не выдан: {res}')
+        return
+    log_action(None, admin_id, f'ban_cmd:{code}', f'banned:{user_id}')
+    tail = ('навсегда' if res.get('is_permanent')
+            else f'до {_fmt_until(res.get("expires_at"))}')
+    send_keyboard(chat_id,
+                  f'🚫 <b>БАН ВЫДАН</b>\n\nПользователь id {_esc(user_id)}\n'
+                  f'Срок: <b>{_esc(BAN_LABELS.get(code, code))}</b> ({_esc(tail)})',
+                  unban_kb(0, user_id))
+
+
+def cmd_unban(chat_id, user_id, admin_id):
+    ok, res = vds_post('/admin/unban', {'user_id': str(user_id),
+                                        'admin_id': str(admin_id)})
+    if not ok:
+        send(chat_id, f'❌ Снять бан не удалось: {res}')
+        return
+    log_action(None, admin_id, f'unban_cmd:{user_id}', 'lifted')
+    send(chat_id, f'♻️ Бан снят: id {user_id}\nБлокировка у пользователя исчезла '
+                  f'сразу, перезагружать страницу ему не нужно.')
+
+
+def cmd_baninfo(chat_id, user_id):
+    ok, res = vds_get('/admin/ban_status', {'user_id': str(user_id)})
+    if not ok:
+        send(chat_id, f'❌ {res}')
+        return
+    if not res.get('is_banned'):
+        send(chat_id, f'✅ id {user_id} не забанен')
+        return
+    send_keyboard(chat_id,
+                  f'🚫 id {_esc(user_id)} <b>забанен</b>\n'
+                  f'Выдан: {_esc(_fmt_until(res.get("banned_at")))}\n'
+                  f'Истекает: {_esc(_fmt_until(res.get("expires_at")))}\n'
+                  f'Причина: {_esc(res.get("reason") or "—")}',
+                  unban_kb(0, user_id))
 
 
 # --------------------------------------------------------------- вебхук
@@ -828,6 +1006,11 @@ def webhook(secret):
                 handle_ban_pick(rid, parts[2], from_id, callback_id,
                                 cq_chat_id, cq_msg_id)
                 return jsonify({'ok': True})
+            if len(parts) == 3 and parts[0] == 'ub':
+                rid = int(parts[1]) if parts[1].isdigit() else 0
+                handle_unban_button(rid, parts[2], from_id, callback_id,
+                                    cq_chat_id, cq_msg_id, cq_msg)
+                return jsonify({'ok': True})
             if len(parts) == 3 and parts[0] == 'bu':
                 rid = int(parts[1]) if parts[1].isdigit() else 0
                 idx = int(parts[2]) if parts[2].isdigit() else -1
@@ -864,7 +1047,31 @@ def webhook(secret):
                 send(chat_id, 'Бот жалоб на связи.\n\n'
                               '/diag — самопроверка\n'
                               '/dump 29 — выгрузить переписку чата 29\n'
-                              '/last — последние жалобы')
+                              '/last — последние жалобы\n'
+                              '/ban 123 d3 — забанить (коды: h1 h3 h5 h7 h10 h12, '
+                              'd1 d3 d5 d7 d10, m1 m2 m3, perm)\n'
+                              '/unban 123 — снять бан\n'
+                              '/baninfo 123 — проверить бан')
+            elif text.startswith('/unban'):
+                arg = re.sub(r'\D', '', text[6:])
+                if not arg:
+                    send(chat_id, 'Формат: /unban 123 — id пользователя на платформе')
+                else:
+                    run_bg(cmd_unban, chat_id, arg, from_id)
+            elif text.startswith('/baninfo'):
+                arg = re.sub(r'\D', '', text[8:])
+                if not arg:
+                    send(chat_id, 'Формат: /baninfo 123')
+                else:
+                    run_bg(cmd_baninfo, chat_id, arg)
+            elif text.startswith('/ban'):
+                arg_parts = text.split()
+                m_ok = len(arg_parts) == 3 and arg_parts[1].isdigit()
+                if not m_ok:
+                    send(chat_id, 'Формат: /ban 123 d3\n\nКоды срока: h1 h3 h5 h7 '
+                                  'h10 h12, d1 d3 d5 d7 d10, m1 m2 m3, perm')
+                else:
+                    run_bg(cmd_ban, chat_id, arg_parts[1], arg_parts[2], from_id)
             elif text.startswith('/last'):
                 run_bg(lambda: send(chat_id, format_last_reports()))
             elif text.startswith('/diag'):
