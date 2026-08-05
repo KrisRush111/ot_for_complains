@@ -167,6 +167,24 @@ CREATE TABLE IF NOT EXISTS report_actions (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_report_actions_report ON report_actions (report_id);
+
+-- Состояние меню бана под конкретным сообщением. Раньше жило только в памяти
+-- процесса, поэтому ломалось в двух случаях: gunicorn с несколькими воркерами
+-- (relay попал в воркер A, нажатие кнопки — в воркер B) и любой рестарт/сон
+-- Render. Тогда бот не знал ни текста жалобы, ни участников и писал
+-- «Не удалось определить участников». Теперь состояние переживает и то, и то.
+CREATE TABLE IF NOT EXISTS ban_menu_state (
+    chat_id     TEXT        NOT NULL,
+    message_id  BIGINT      NOT NULL,
+    rid         BIGINT,
+    chat_ref    TEXT,
+    text        TEXT,
+    users       JSONB,
+    target      JSONB,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (chat_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ban_menu_state_updated ON ban_menu_state (updated_at);
 """
 
 _init_lock = threading.Lock()
@@ -478,20 +496,101 @@ def _mkey(chat_id, message_id):
     return f'{chat_id}:{message_id}'
 
 
+def _ban_state_db_save(chat_id, message_id, st):
+    """Пишем состояние в БД бота. Без этого меню живёт только внутри одного
+    процесса: второй воркер gunicorn или рестарт Render теряют и текст жалобы,
+    и список участников."""
+    if not pool:
+        return
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                """INSERT INTO ban_menu_state
+                       (chat_id, message_id, rid, chat_ref, text, users, target, updated_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                   ON CONFLICT (chat_id, message_id) DO UPDATE SET
+                       rid = COALESCE(EXCLUDED.rid, ban_menu_state.rid),
+                       chat_ref = COALESCE(NULLIF(EXCLUDED.chat_ref, ''), ban_menu_state.chat_ref),
+                       text = COALESCE(NULLIF(EXCLUDED.text, ''), ban_menu_state.text),
+                       users = CASE
+                                 WHEN jsonb_array_length(COALESCE(EXCLUDED.users, '[]'::jsonb)) > 0
+                                 THEN EXCLUDED.users ELSE ban_menu_state.users END,
+                       target = EXCLUDED.target,
+                       updated_at = NOW()""",
+                (str(chat_id), int(message_id), st.get('rid') or None,
+                 st.get('chat_ref') or '', st.get('text') or '',
+                 json.dumps(st.get('users') or [], ensure_ascii=False),
+                 json.dumps(st.get('target')) if st.get('target') else None)
+            )
+            # чистим старое, чтобы таблица не росла бесконечно
+            conn.execute("DELETE FROM ban_menu_state "
+                         "WHERE updated_at < NOW() - INTERVAL '60 days'")
+    except Exception as e:
+        log.error('ban_state_db_save: %s', e)
+
+
+def _ban_state_db_load(chat_id, message_id):
+    if not pool:
+        return None
+    try:
+        with pool.connection() as conn:
+            row = conn.execute(
+                """SELECT rid, chat_ref, text, users, target
+                     FROM ban_menu_state
+                    WHERE chat_id = %s AND message_id = %s""",
+                (str(chat_id), int(message_id))
+            ).fetchone()
+        if not row:
+            return None
+        users = row[3]
+        if isinstance(users, str):
+            users = json.loads(users or '[]')
+        target = row[4]
+        if isinstance(target, str):
+            target = json.loads(target) if target else None
+        return {'rid': row[0] or 0, 'chat_ref': row[1] or '', 'text': row[2] or '',
+                'users': users or [], 'target': target}
+    except Exception as e:
+        log.error('ban_state_db_load: %s', e)
+        return None
+
+
 def ban_state_put(chat_id, message_id, **fields):
     key = _mkey(chat_id, message_id)
+    with _ban_lock:
+        hydrate = key not in _BAN_STATE
+    if hydrate:
+        # подтягиваем то, что уже знает БД, иначе частичное обновление
+        # (например target=None при отмене) затрёт участников и текст жалобы
+        db = _ban_state_db_load(chat_id, message_id)
+        if db:
+            with _ban_lock:
+                _BAN_STATE.setdefault(key, {}).update(db)
     with _ban_lock:
         st = _BAN_STATE.setdefault(key, {})
         st.update(fields)
         if len(_BAN_STATE) > 300:
             for k in list(_BAN_STATE)[:100]:
                 _BAN_STATE.pop(k, None)
-        return st
+        snapshot = dict(st)
+    _ban_state_db_save(chat_id, message_id, snapshot)
+    return snapshot
 
 
 def ban_state_get(chat_id, message_id):
+    """Сначала память процесса (быстро), потом БД — она общая для всех воркеров
+    и переживает рестарт."""
     with _ban_lock:
-        return dict(_BAN_STATE.get(_mkey(chat_id, message_id)) or {})
+        st = dict(_BAN_STATE.get(_mkey(chat_id, message_id)) or {})
+    if st.get('text') or st.get('users'):
+        return st
+    db = _ban_state_db_load(chat_id, message_id)
+    if not db:
+        return st
+    merged = {**db, **{k: v for k, v in st.items() if v}}
+    with _ban_lock:
+        _BAN_STATE[_mkey(chat_id, message_id)] = dict(merged)
+    return merged
 
 
 def _btn(text, data):
@@ -580,6 +679,24 @@ def resolve_users(rid, chat_ref, why=None):
         if not chat_ref:
             chat_ref = re.sub(r'\D', '', str(rep.get('chat_id') or ''))
 
+    # Фолбэк на ВДС: у него жалоба лежит в своей БД (user_reports) вместе с
+    # участниками чата. База бота на Render — другая, поэтому get_report выше
+    # часто возвращает пусто.
+    if not users and rid:
+        ok, res = vds_get('/admin/report_info', {'report_id': str(rid)})
+        if ok:
+            for p in (res.get('participants') or []):
+                uid = str(p.get('user_id') or '')
+                if uid:
+                    users.append({'id': uid,
+                                  'nick': p.get('nickname') or f'id {uid}'})
+            if not chat_ref:
+                chat_ref = re.sub(r'\D', '', str(res.get('chat_id') or ''))
+            if not users:
+                why.append(f'• ВДС знает жалобу #{rid}, но участников чата не отдал')
+        else:
+            why.append(f'• ВДС не отдал жалобу #{rid}: {res}')
+
     if not users and not chat_ref:
         why.append('• в жалобе нет chat_id, поэтому участников не спросить у ВДС')
 
@@ -615,9 +732,13 @@ def open_user_screen(rid, admin_id, chat_id, message_id, orig_text, chat_ref,
         send(ADMIN_TELEGRAM_ID,
              f'❌ Не удалось определить участников жалобы #{rid or "—"}.\n\n'
              + ('\n'.join(why) if why else '• источники не вернули данных')
-             + '\n\nСамое надёжное — чтобы ВДС передавал в POST /relay/report '
-               'поля reported_id, reported_nickname, reporter_id, '
-               'reporter_nickname и participants: тогда БД и ВДС не нужны.')
+             + '\n\nЧто проверить:\n'
+               '• на ВДС есть эндпоинт GET /admin/report_info (новый) и '
+               'VDS_ADMIN_SECRET у бота совпадает с ADMIN_DUMP_SECRET на ВДС;\n'
+               '• ВДС передаёт в POST /relay/report поля reported_id, '
+               'reported_nickname, reporter_id, reporter_nickname и '
+               'participants — тогда ни БД, ни запрос на ВДС не нужны;\n'
+               '• забанить вручную всегда можно командой: /ban <id> d3')
         return
     ban_state_put(chat_id, message_id, rid=rid, chat_ref=chat_ref,
                   text=orig_text, users=users, target=None)
@@ -821,14 +942,24 @@ def _do_unban(rid, user_id, admin_id, cq_chat_id, cq_msg_id, orig_text):
 
     note = (f'♻️ <b>Бан снят</b> — id {_esc(user_id)} снова пользуется платформой '
             f'(блокировка исчезла у него сразу, без перезагрузки).\n'
-            f'Ниже снова жалоба: можно выдать другой срок.')
+            f'Ниже снова жалоба: «отправить БАН» опять спросит, <b>кому</b> и '
+            f'<b>на какой срок</b>.')
 
     st = ban_state_get(cq_chat_id, cq_msg_id)
+
+    # Если участников в состоянии нет (рестарт, другой воркер), кладём хотя бы
+    # разбаненного — тогда экран выбора пользователя точно откроется, а не
+    # упадёт в «не удалось определить участников».
+    if not st.get('users'):
+        ban_state_put(cq_chat_id, cq_msg_id, rid=rid or 0,
+                      users=[{'id': str(user_id), 'nick': f'id {user_id}'}])
+
     if st.get('text'):
         restore_report_view(rid, cq_chat_id, cq_msg_id, note=note)
     else:
         # жалобы под этим сообщением нет (например, бан из /ban) — тогда просто
         # подтверждение, но с кнопкой, чтобы забанить заново.
+        ban_state_put(cq_chat_id, cq_msg_id, target=None)
         edit_keyboard(cq_chat_id, cq_msg_id, note,
                       {'inline_keyboard': [[
                           _btn('🚫 отправить БАН', f'rep:{rid or 0}:ban'),
