@@ -753,11 +753,10 @@ def _do_ban(rid, code, admin_id, cq_chat_id, cq_msg_id, target):
 
     if not ok:
         log_action(rid or None, admin_id, f'ban_pick:{code}', f'error: {res}'[:200])
-        st = ban_state_get(cq_chat_id, cq_msg_id)
-        edit_keyboard(cq_chat_id, cq_msg_id,
-                      f'❌ <b>Бан НЕ выдан</b>\nПользователь: {_esc(nick)} — {_esc(label)}\n\n'
-                      f'{_esc(res)}',
-                      report_kb(rid, st.get('chat_ref') or ''))
+        restore_report_view(
+            rid, cq_chat_id, cq_msg_id,
+            note=(f'❌ <b>Бан НЕ выдан</b>\nПользователь: {_esc(nick)} — '
+                  f'{_esc(label)}\n{_esc(res)}'))
         return
 
     log_action(rid or None, admin_id, f'ban_pick:{code}', f'banned:{target["id"]}')
@@ -794,6 +793,21 @@ def handle_ban_pick(rid, code, admin_id, callback_id, cq_chat_id, cq_msg_id):
     run_bg(_do_ban, rid, code, admin_id, cq_chat_id, cq_msg_id, target)
 
 
+def restore_report_view(rid, cq_chat_id, cq_msg_id, note='', fallback_text=''):
+    """Возвращает сообщение к исходному тексту жалобы с кнопками «отчёт» и
+    «отправить БАН» — чтобы сразу можно было выдать другой срок.
+    Оригинал жалобы лежит в _BAN_STATE (положен при доставке через relay),
+    поэтому HTML в нём валидный. Если состояние потерялось (рестарт процесса),
+    берём fallback_text."""
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+    body = st.get('text') or fallback_text or f'Жалоба #{rid or "—"}'
+    text = (note + '\n\n' + body) if note else body
+    # цель сбрасываем: следующий «отправить БАН» снова начнётся с выбора юзера
+    ban_state_put(cq_chat_id, cq_msg_id, target=None)
+    edit_keyboard(cq_chat_id, cq_msg_id, text,
+                  report_kb(rid, st.get('chat_ref') or ''))
+
+
 def _do_unban(rid, user_id, admin_id, cq_chat_id, cq_msg_id, orig_text):
     ok, res = vds_post('/admin/unban', {'user_id': str(user_id),
                                         'admin_id': str(admin_id)})
@@ -804,19 +818,28 @@ def _do_unban(rid, user_id, admin_id, cq_chat_id, cq_msg_id, orig_text):
                       unban_kb(rid, user_id))
         return
     log_action(rid or None, admin_id, f'unban:{user_id}', 'lifted')
-    edit_keyboard(cq_chat_id, cq_msg_id,
-                  f'♻️ <b>БАН СНЯТ</b>\n\nПользователь id {_esc(user_id)} снова '
-                  f'пользуется платформой — блокировка у него исчезла сразу, '
-                  f'без перезагрузки страницы.'
-                  + (f'\nЖалоба #{rid}' if rid else ''),
-                  {'inline_keyboard': []})
+
+    note = (f'♻️ <b>Бан снят</b> — id {_esc(user_id)} снова пользуется платформой '
+            f'(блокировка исчезла у него сразу, без перезагрузки).\n'
+            f'Ниже снова жалоба: можно выдать другой срок.')
+
+    st = ban_state_get(cq_chat_id, cq_msg_id)
+    if st.get('text'):
+        restore_report_view(rid, cq_chat_id, cq_msg_id, note=note)
+    else:
+        # жалобы под этим сообщением нет (например, бан из /ban) — тогда просто
+        # подтверждение, но с кнопкой, чтобы забанить заново.
+        edit_keyboard(cq_chat_id, cq_msg_id, note,
+                      {'inline_keyboard': [[
+                          _btn('🚫 отправить БАН', f'rep:{rid or 0}:ban'),
+                      ]]})
 
 
 def handle_unban_button(rid, user_id, admin_id, callback_id, cq_chat_id, cq_msg_id,
                         cq_msg=None):
     """Нажата «♻️ ОТМЕНИТЬ БАН» под подтверждением бана."""
     orig = (cq_msg or {}).get('text') or 'Бан'
-    answer_callback(callback_id, '', alert=False)
+    answer_callback(callback_id, 'Снимаю бан…', alert=False)
     run_bg(_do_unban, rid, user_id, admin_id, cq_chat_id, cq_msg_id, _esc(orig))
 
 
