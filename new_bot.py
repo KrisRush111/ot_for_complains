@@ -598,12 +598,17 @@ def _btn(text, data):
 
 
 def report_kb(rid, chat_ref=''):
-    """Исходная клавиатура под жалобой — нужна и для relay, и для отмены."""
-    msgs_cb = f'rep:{rid}:msgs:{chat_ref}' if chat_ref else f'rep:{rid}:msgs'
-    return {'inline_keyboard': [[
-        _btn('📄 отчёт', msgs_cb),
-        _btn('🚫 отправить БАН', f'rep:{rid}:ban'),
-    ]]}
+    """Исходная клавиатура под жалобой — нужна и для relay, и для отмены.
+
+    Без chat_ref (жалоба на человека, с которым у жалобщика нет переписки —
+    например, из профиля на странице контактов) кнопку «отчёт» не рисуем
+    вообще: выгружать нечего, а нажатие всё равно вернуло бы ошибку.
+    """
+    row = []
+    if chat_ref:
+        row.append(_btn('📄 отчёт', f'rep:{rid}:msgs:{chat_ref}'))
+    row.append(_btn('🚫 отправить БАН', f'rep:{rid}:ban'))
+    return {'inline_keyboard': [row]}
 
 
 def ban_kb_users(rid, users):
@@ -1327,10 +1332,15 @@ def relay_report():
     except (TypeError, ValueError):
         rid = 0
 
+    # Отрицательный id — временный чат, которого в БД ещё нет (ВДС отдаёт такой,
+    # пока переписку не создали), поэтому считаем это «чата нет».
     chat_ref = re.sub(r'\D', '', str(data.get('chat_id') or ''))[:20]
+    if chat_ref and (str(data.get('chat_id') or '').strip().startswith('-')
+                     or chat_ref.lstrip('0') == ''):
+        chat_ref = ''
     if not chat_ref:
-        log.warning('relay: жалоба #%s пришла без chat_id — кнопка выгрузки '
-                    'сможет опереться только на БД', rid)
+        log.info('relay: жалоба #%s без chat_id — переписки нет, отправляем '
+                 'без кнопки отчёта', rid)
 
     # Участники прямо из жалобы: тогда экран «кому отправить» открывается
     # мгновенно, без запроса в БД и на ВДС.
